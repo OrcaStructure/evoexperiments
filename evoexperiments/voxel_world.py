@@ -10,16 +10,16 @@ Color = Tuple[float, float, float, float]
 
 # Default colors by block type for convenience (used when no color is provided).
 BLOCK_DEFAULT_COLORS: Dict[str, Color] = {
-    "stone": (0.55, 0.45, 0.4, 1.0),
-    "redstone_block": (0.6, 0.1, 0.1, 1.0),
-    "piston": (0.35, 0.6, 0.35, 1.0),
-    "sticky_piston": (0.15, 0.55, 0.7, 1.0),
-    "slime": (0.8, 0.6, 0.2, 1.0),
-    "observer": (0.45, 0.2, 0.6, 1.0),
+    # Closer-to-material hues.
+    "stone": (0.75, 0.77, 0.78, 1.0),  # light grey
+    "redstone_block": (0.76, 0.09, 0.09, 1.0),  # redstone block
+    "piston": (0.42, 0.44, 0.47, 1.0),  # dark grey piston body
+    "sticky_piston": (0.32, 0.34, 0.37, 1.0),  # darker sticky piston body
+    "slime": (0.62, 0.86, 0.60, 1.0),  # slime green
 }
 
 
-def _resolve_color(color: Optional[Iterable[float]] | None, block_type: str = BLOCK_STONE) -> Color:
+def _resolve_color(color: Optional[Iterable[float]] | None, block_type: str = "stone") -> Color:
     if color is None:
         return BLOCK_DEFAULT_COLORS.get(block_type, (0.6, 0.6, 0.6, 1.0))
     if isinstance(color, str):
@@ -44,7 +44,7 @@ BLOCK_REDSTONE = "redstone_block"
 BLOCK_PISTON = "piston"
 BLOCK_STICKY_PISTON = "sticky_piston"
 BLOCK_SLIME = "slime"
-BLOCK_OBSERVER = "observer"
+BLOCK_PISTON_HEAD = "piston_head"
 
 ALL_BLOCKS = {
     BLOCK_STONE,
@@ -52,7 +52,7 @@ ALL_BLOCKS = {
     BLOCK_PISTON,
     BLOCK_STICKY_PISTON,
     BLOCK_SLIME,
-    BLOCK_OBSERVER,
+    BLOCK_PISTON_HEAD,
 }
 
 
@@ -81,7 +81,6 @@ class VoxelWorld:
 
     def __init__(self) -> None:
         self.blocks: Dict[Tuple[int, int, int], Block] = {}
-        self._prev_state: Dict[Tuple[int, int, int], Block] = {}
 
     def add_block(
         self,
@@ -108,75 +107,65 @@ class VoxelWorld:
 
     # --- Simulation -----------------------------------------------------
     def tick(self) -> None:
-        """Advance one logic tick (power, observers, pistons, slime pushes)."""
-        prev_state = self._prev_state
-        self._prev_state = self.blocks.copy()
+        """Advance one logic tick (power, pistons, slime pushes)."""
+        power_sources: Set[Tuple[int, int, int]] = {pos for pos, b in self.blocks.items() if b.type == BLOCK_REDSTONE}
 
-        power_sources: Set[Tuple[int, int, int]] = set()
-        # Redstone blocks always powered.
-        for pos, b in self.blocks.items():
-            if b.type == BLOCK_REDSTONE:
-                power_sources.add(pos)
-
-        # Observers detect changes.
-        observer_pulses: Set[Tuple[int, int, int]] = set()
-        for pos, b in self.blocks.items():
-            if b.type != BLOCK_OBSERVER:
-                continue
-            target_pos = tuple(np.add(pos, b.facing))
-            prev = prev_state.get(target_pos)
-            curr = self.blocks.get(target_pos)
-            if prev != curr:
-                observer_pulses.add(pos)
-                power_sources.add(pos)
-
-        # Determine which blocks are powered (adjacent to a power source).
         powered_blocks: Set[Tuple[int, int, int]] = set()
         for pos in power_sources:
             for npos in self._adjacent(pos):
                 if npos in self.blocks:
                     powered_blocks.add(npos)
 
-        # Update pistons.
         moves: List[Tuple[Tuple[int, int, int], Tuple[int, int, int]]] = []
+        head_additions: list[Tuple[Tuple[int, int, int], Block]] = []
         new_blocks = self.blocks.copy()
+
         for pos, b in list(self.blocks.items()):
             is_piston = b.type in (BLOCK_PISTON, BLOCK_STICKY_PISTON)
             if not is_piston:
-                # Update powered flag for non-pistons as well.
                 if b.powered != (pos in powered_blocks or pos in power_sources):
                     new_blocks[pos] = replace(b, powered=(pos in powered_blocks or pos in power_sources))
                 continue
             currently_powered = pos in powered_blocks or pos in power_sources
             if currently_powered and not b.extended:
-                # Try to extend and push.
                 facing = b.facing
                 head_pos = tuple(np.add(pos, facing))
-                cluster = self._gather_push_cluster(head_pos, facing)
-                if self._can_move(cluster, facing):
+                cluster = self._gather_push_cluster(head_pos, facing, forbidden={pos})
+                if self._can_move(cluster, facing, occupied=new_blocks):
                     moves.extend(self._plan_moves(cluster, facing))
                     new_blocks[pos] = replace(b, powered=True, extended=True)
+                    head_additions.append((head_pos, b))
+                else:
+                    if not b.powered:
+                        new_blocks[pos] = replace(b, powered=True)
             elif not currently_powered and b.extended:
-                # Retract
                 head_pos = tuple(np.add(pos, b.facing))
-                if b.type == BLOCK_STICKY_PISTON and head_pos in new_blocks:
-                    pulled_target = head_pos  # where the head was
+                new_blocks.pop(head_pos, None)
+                if b.type == BLOCK_STICKY_PISTON:
                     pulled_from = tuple(np.add(head_pos, b.facing))
-                    if pulled_target not in new_blocks:
-                        block_to_pull = new_blocks.pop(pulled_from, None)
-                        if block_to_pull:
-                            new_blocks[pulled_target] = replace(block_to_pull, pos=pulled_target)
+                    cluster = self._gather_push_cluster(pulled_from, b.facing, forbidden={pos, head_pos})
+                    back_dir = tuple(-x for x in b.facing)
+                    if cluster and self._can_move(cluster, back_dir, occupied=new_blocks, allow_override={head_pos}):
+                        moves.extend(self._plan_moves(cluster, back_dir))
                 new_blocks[pos] = replace(b, powered=False, extended=False)
             else:
-                # Just update powered flag
                 if b.powered != currently_powered:
                     new_blocks[pos] = replace(b, powered=currently_powered)
 
-        # Apply movement (sorted farthest first).
         for src, dst in sorted(moves, key=lambda p: self._move_sort_key(p[0], p[1]), reverse=True):
             block = new_blocks.pop(src, None)
             if block:
                 new_blocks[dst] = replace(block, pos=dst)
+
+        for head_pos, piston_block in head_additions:
+            new_blocks[head_pos] = Block(
+                pos=head_pos,
+                color=piston_block.color,
+                type=BLOCK_PISTON_HEAD,
+                facing=piston_block.facing,
+                powered=True,
+                extended=True,
+            )
 
         self.blocks = new_blocks
 
@@ -188,18 +177,33 @@ class VoxelWorld:
         for dx, dy, dz in FACES.values():
             yield (x + dx, y + dy, z + dz)
 
-    def _gather_push_cluster(self, start: Tuple[int, int, int], direction: Tuple[int, int, int]) -> Set[Tuple[int, int, int]]:
-        """Collect blocks to move; slime chains pull adjacent blocks (including other slime blocks)."""
+    def _gather_push_cluster(
+        self,
+        start: Tuple[int, int, int],
+        direction: Tuple[int, int, int],
+        forbidden: Optional[Set[Tuple[int, int, int]]] = None,
+    ) -> Set[Tuple[int, int, int]]:
+        """
+        Collect the full set of blocks that will be pushed by a piston.
+
+        We always include the line of blocks in front of the piston (so pushes
+        propagate even without slime), and slime blocks also grab any adjacent
+        blocks to move with them.
+        """
         if start not in self.blocks:
             return set()
         cluster: Set[Tuple[int, int, int]] = set()
         queue = [start]
         while queue:
             pos = queue.pop()
-            if pos in cluster or pos not in self.blocks:
+            if pos in cluster or pos not in self.blocks or (forbidden and pos in forbidden):
                 continue
             cluster.add(pos)
             block = self.blocks[pos]
+            # Always follow the chain directly in front of the piston so pushes propagate.
+            forward = tuple(np.add(pos, direction))
+            if forward in self.blocks:
+                queue.append(forward)
             if block.type == BLOCK_SLIME:
                 for npos in self._adjacent(pos):
                     if npos in self.blocks:
@@ -209,10 +213,19 @@ class VoxelWorld:
             cluster = set(list(cluster)[:12])
         return cluster
 
-    def _can_move(self, cluster: Set[Tuple[int, int, int]], direction: Tuple[int, int, int]) -> bool:
+    def _can_move(
+        self,
+        cluster: Set[Tuple[int, int, int]],
+        direction: Tuple[int, int, int],
+        *,
+        occupied: Optional[Dict[Tuple[int, int, int], Block]] = None,
+        allow_override: Optional[Set[Tuple[int, int, int]]] = None,
+    ) -> bool:
+        occupied = occupied if occupied is not None else self.blocks
+        allow_override = allow_override or set()
         for pos in cluster:
             target = tuple(np.add(pos, direction))
-            if target in self.blocks and target not in cluster:
+            if target in occupied and target not in cluster and target not in allow_override:
                 return False
         return True
 
@@ -240,15 +253,7 @@ class VoxelWorld:
         if not self.blocks:
             return np.zeros((0, 0, 0), dtype=bool), np.zeros((0, 0, 0, 4), dtype=float)
 
-        # Gather positions including piston heads for bounding box.
-        head_positions: list[Tuple[Tuple[int, int, int], Color]] = []
-        for pos, b in self.blocks.items():
-            if b.type in (BLOCK_PISTON, BLOCK_STICKY_PISTON) and b.extended:
-                head_pos = tuple(np.add(pos, b.facing))
-                head_color = self._piston_head_color(b.color)
-                head_positions.append((head_pos, head_color))
-
-        all_positions = list(self.blocks.keys()) + [hp[0] for hp in head_positions]
+        all_positions = list(self.blocks.keys())
         coords = np.array(all_positions, dtype=int)
         mins = coords.min(axis=0) - margin
         maxs = coords.max(axis=0) + margin
@@ -259,13 +264,7 @@ class VoxelWorld:
         for pos, block in self.blocks.items():
             idx = tuple((np.array(pos) - mins).astype(int).tolist())
             occupied[idx] = True
-            colors[idx] = block.color
-
-        # Render piston heads.
-        for head_pos, head_color in head_positions:
-            idx = tuple((np.array(head_pos) - mins).astype(int).tolist())
-            occupied[idx] = True
-            colors[idx] = head_color
+            colors[idx] = self._piston_head_color(block.color) if block.type == BLOCK_PISTON_HEAD else block.color
 
         return occupied, colors
 
